@@ -22,31 +22,26 @@ async fn get_wifi_interface(nmrs: &nmrs::NetworkManager) -> Option<nmrs::WifiDev
 
 type AudioProducer = ringbuf::HeapProd<i16>;
 
-struct AndroidAutoInner {
-    relay: Option<tokio::task::JoinHandle<()>>,
-    connected: bool,
-    send: tokio::sync::mpsc::Sender<MessageFromAsync>,
-    arecv: Option<tokio::sync::mpsc::Receiver<android_auto::SendableAndroidAutoMessage>>,
-    android_send: tokio::sync::mpsc::Sender<android_auto::SendableAndroidAutoMessage>,
-    audio_input: Option<cpal::Device>,
-    media_stream: Option<(AudioProducer, cpal::Stream)>,
-    sys_stream: Option<(AudioProducer, cpal::Stream)>,
-    speech_stream: Option<(AudioProducer, cpal::Stream)>,
-    input_stream: Option<cpal::Stream>,
-    /// Fallback output used for any channel whose fixed-format stream could not be opened.
-    mixer: Option<Arc<Mixer>>,
-    mixer_stream: Option<cpal::Stream>,
-}
+static MEDIA_BYTES: std::sync::LazyLock<Arc<std::sync::atomic::AtomicU64>> = std::sync::LazyLock::new(Default::default);
+static SYS_BYTES: std::sync::LazyLock<Arc<std::sync::atomic::AtomicU64>> = std::sync::LazyLock::new(Default::default);
+static SPEECH_BYTES: std::sync::LazyLock<Arc<std::sync::atomic::AtomicU64>> = std::sync::LazyLock::new(Default::default);
+static MIC_BYTES: std::sync::LazyLock<Arc<std::sync::atomic::AtomicU64>> = std::sync::LazyLock::new(Default::default);
 
-/// Output path for platforms whose default device does not offer i16 at the channel's native
-/// rate (CoreAudio on macOS exposes only f32 at the device rate, so all three fixed-format
-/// streams above fail to open and the phone's audio is silently discarded). Every channel is
-/// converted to mono f32 at the device rate with linear interpolation and drained by a single
-/// output stream. Not real-time safe; adequate for the example.
+
+/// Output mixer: converts each channel to mono f32 at the device rate; one cpal output
+/// stream drains it. Added 2026-09-20 because the upstream asks CoreAudio for i16/16 kHz
+/// streams that macOS refuses, so nothing was audible.
 struct Mixer {
     queue: std::sync::Mutex<std::collections::VecDeque<f32>>,
     device_rate: u32,
 }
+static MIXER: std::sync::OnceLock<Arc<Mixer>> = std::sync::OnceLock::new();
+static OUT_STREAM: std::sync::Mutex<Option<cpal::Stream>> = std::sync::Mutex::new(None);
+static SPEECH_DUMP: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+static MEDIA_DUMP: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+// cpal::Stream is !Send; it is only ever touched from the UI thread that created it.
+unsafe impl Send for SendStream {}
+struct SendStream(#[allow(dead_code)] cpal::Stream);
 
 impl Mixer {
     fn push(&self, pcm: &[u8], src_rate: u32, src_channels: usize) {
@@ -73,7 +68,6 @@ impl Mixer {
             let t = (pos - i0 as f64) as f32;
             q.push_back(frames[i0] * (1.0 - t) + frames[i1] * t);
         }
-        // Bound the backlog at three seconds so a stalled callback cannot grow it forever.
         let cap = self.device_rate as usize * 3;
         while q.len() > cap {
             q.pop_front();
@@ -81,38 +75,68 @@ impl Mixer {
     }
 }
 
-/// Open one output stream in the device's default format and return it with its mixer.
-fn open_fallback_output(dev: &cpal::Device) -> Option<(Arc<Mixer>, cpal::Stream)> {
-    let cfg = dev.default_output_config().ok()?;
-    let mixer = Arc::new(Mixer {
-        queue: Default::default(),
-        device_rate: cfg.sample_rate(),
-    });
+fn start_mixer_output() {
+    // Once per process: the container is rebuilt on every phone reconnect, and dropping a
+    // CoreAudio stream from a thread other than its creator has crashed the process.
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    let host = cpal::default_host();
+    let Some(dev) = host.default_output_device() else { log::error!("PROBE no output device"); return };
+    let Ok(cfg) = dev.default_output_config() else { log::error!("PROBE no output config"); return };
+    let mixer = Arc::new(Mixer { queue: Default::default(), device_rate: cfg.sample_rate() });
+    let _ = MIXER.set(mixer.clone());
     let ch = cfg.channels() as usize;
-    let m2 = mixer.clone();
-    let stream = dev
-        .build_output_stream(
-            &cfg.config(),
-            move |out: &mut [f32], _| {
-                let mut q = m2.queue.lock().unwrap();
-                for frame in out.chunks_mut(ch) {
-                    let v = q.pop_front().unwrap_or(0.0);
-                    for s in frame.iter_mut() {
-                        *s = v;
-                    }
-                }
-            },
-            |e| log::error!("Fallback audio output error: {:?}", e),
-            None,
-        )
-        .ok()?;
-    log::info!(
-        "Fallback audio output opened at {} Hz, {} channels, {:?}",
-        cfg.sample_rate(),
-        ch,
-        cfg.sample_format()
-    );
-    Some((mixer, stream))
+    log::error!("PROBE speaker {} Hz {} ch {:?}", cfg.sample_rate(), ch, cfg.sample_format());
+    match dev.build_output_stream(
+        &cfg.config(),
+        move |out: &mut [f32], _| {
+            let mut q = mixer.queue.lock().unwrap();
+            for frame in out.chunks_mut(ch) {
+                let v = q.pop_front().unwrap_or(0.0);
+                for s in frame.iter_mut() { *s = v; }
+            }
+        },
+        |e| log::error!("PROBE speaker error: {e:?}"),
+        None,
+    ) {
+        Ok(st) => { let _ = st.play(); *OUT_STREAM.lock().unwrap() = Some(st); }
+        Err(e) => log::error!("PROBE speaker build failed: {e}"),
+    }
+    *SPEECH_DUMP.lock().unwrap() = std::fs::File::create("speech-16k-s16le-1ch.pcm").ok();
+    *MEDIA_DUMP.lock().unwrap() = std::fs::File::create("media-48k-s16le-2ch.pcm").ok();
+}
+
+fn spawn_stream_reporter() {
+    tokio::spawn(async {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let m = MEDIA_BYTES.swap(0, Relaxed);
+            let y = SYS_BYTES.swap(0, Relaxed);
+            let s = SPEECH_BYTES.swap(0, Relaxed);
+            let i = MIC_BYTES.swap(0, Relaxed);
+            if m + y + s + i > 0 {
+                log::error!("PROBE streams  MEDIA {m} B/s  SPEECH(guidance) {s} B/s  SYSTEM {y} B/s  | mic→phone {i} B/s");
+            }
+        }
+    });
+}
+
+struct AndroidAutoInner {
+    relay: Option<tokio::task::JoinHandle<()>>,
+    connected: bool,
+    send: tokio::sync::mpsc::Sender<MessageFromAsync>,
+    arecv: Option<tokio::sync::mpsc::Receiver<android_auto::SendableAndroidAutoMessage>>,
+    android_send: tokio::sync::mpsc::Sender<android_auto::SendableAndroidAutoMessage>,
+    audio_input: Option<cpal::Device>,
+    media_stream: Option<(AudioProducer, cpal::Stream)>,
+    sys_stream: Option<(AudioProducer, cpal::Stream)>,
+    speech_stream: Option<(AudioProducer, cpal::Stream)>,
+    input_stream: Option<cpal::Stream>,
 }
 
 #[cfg(feature = "wireless")]
@@ -249,6 +273,28 @@ impl android_auto::AndroidAutoAudioOutputTrait for AndroidAuto {
     }
 
     async fn receive_output_audio(&self, t: android_auto::AudioChannelType, data: Vec<u8>) {
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            match t {
+                android_auto::AudioChannelType::Media => MEDIA_BYTES.fetch_add(data.len() as u64, Relaxed),
+                android_auto::AudioChannelType::System => SYS_BYTES.fetch_add(data.len() as u64, Relaxed),
+                android_auto::AudioChannelType::Speech => SPEECH_BYTES.fetch_add(data.len() as u64, Relaxed),
+            };
+        }
+        if let Some(m) = MIXER.get() {
+            use std::io::Write;
+            match t {
+                android_auto::AudioChannelType::Media => {
+                    m.push(&data, 48000, 2);
+                    if let Some(f) = MEDIA_DUMP.lock().unwrap().as_mut() { let _ = f.write_all(&data); }
+                }
+                android_auto::AudioChannelType::Speech => {
+                    m.push(&data, 16000, 1);
+                    if let Some(f) = SPEECH_DUMP.lock().unwrap().as_mut() { let _ = f.write_all(&data); }
+                }
+                android_auto::AudioChannelType::System => m.push(&data, 16000, 1),
+            }
+        }
         let mut s = self.inner.lock().await;
         let r2: Vec<i16> = data
             .chunks_exact(2)
@@ -256,30 +302,19 @@ impl android_auto::AndroidAutoAudioOutputTrait for AndroidAuto {
             .collect();
         match t {
             android_auto::AudioChannelType::Media => {
-                if let Some(m) = s.media_stream.as_mut() {
-                    m.0.push_slice(&r2);
-                } else if let Some(mx) = &s.mixer {
-                    mx.push(&data, 48000, 2);
-                }
+                s.media_stream.as_mut().map(|m| m.0.push_slice(&r2));
             }
             android_auto::AudioChannelType::System => {
-                if let Some(m) = s.sys_stream.as_mut() {
-                    m.0.push_slice(&r2);
-                } else if let Some(mx) = &s.mixer {
-                    mx.push(&data, 16000, 1);
-                }
+                s.sys_stream.as_mut().map(|m| m.0.push_slice(&r2));
             }
             android_auto::AudioChannelType::Speech => {
-                if let Some(m) = s.speech_stream.as_mut() {
-                    m.0.push_slice(&r2);
-                } else if let Some(mx) = &s.mixer {
-                    mx.push(&data, 16000, 1);
-                }
+                s.speech_stream.as_mut().map(|m| m.0.push_slice(&r2));
             }
         }
     }
 
     async fn start_output_audio(&self, t: android_auto::AudioChannelType) {
+        log::error!("PROBE output START {:?}", t);
         let s = self.inner.lock().await;
         match t {
             android_auto::AudioChannelType::Media => {
@@ -295,6 +330,7 @@ impl android_auto::AndroidAutoAudioOutputTrait for AndroidAuto {
     }
 
     async fn stop_output_audio(&self, t: android_auto::AudioChannelType) {
+        log::error!("PROBE output STOP {:?}", t);
         let s = self.inner.lock().await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         match t {
@@ -325,32 +361,27 @@ impl android_auto::AndroidAutoInputChannelTrait for AndroidAuto {
 #[async_trait::async_trait]
 impl android_auto::AndroidAutoAudioInputTrait for AndroidAuto {
     async fn open_input_channel(&self) -> Result<(), ()> {
-        // The phone expects 16 kHz mono i16. Asking the device for that format directly fails
-        // on platforms that only expose their native rate (CoreAudio), so capture in the
-        // device's default format and convert here: channels averaged to mono, linear
-        // interpolation to 16 kHz, delivered in 20 ms frames.
+        log::error!("PROBE MIC OPEN: starting Mac microphone (default config, resampled to 16 kHz mono)");
         let mut s = self.inner.lock().await;
         let Some(ai) = &s.audio_input else {
-            log::error!("No audio input device");
+            log::error!("PROBE no input device");
             return Ok(());
         };
         let cfg = match ai.default_input_config() {
             Ok(c) => c,
             Err(e) => {
-                log::error!("No default input config: {e}");
+                log::error!("PROBE default_input_config failed: {e}");
                 return Ok(());
             }
         };
         let src_rate = cfg.sample_rate();
         let src_ch = cfg.channels() as usize;
-        log::info!(
-            "Audio input opened at {src_rate} Hz, {src_ch} channels, {:?}",
-            cfg.sample_format()
-        );
+        log::error!("PROBE mic config {src_rate} Hz {src_ch} ch {:?}", cfg.sample_format());
         let android_send = s.android_send.clone();
         let mut pending: Vec<i16> = Vec::new();
         let mut phase = 0f64;
         let step = src_rate as f64 / 16000.0;
+        let mic_bytes = MIC_BYTES.clone();
         match ai.build_input_stream(
             &cfg.config(),
             move |data: &[f32], _| {
@@ -376,6 +407,7 @@ impl android_auto::AndroidAutoAudioInputTrait for AndroidAuto {
                 while pending.len() >= 320 {
                     let frame: Vec<i16> = pending.drain(..320).collect();
                     let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    mic_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -389,11 +421,11 @@ impl android_auto::AndroidAutoAudioInputTrait for AndroidAuto {
             |err| log::error!("Audio input error: {:?}", err),
             None,
         ) {
-            Ok(stream) => {
-                let _ = stream.play();
-                s.input_stream = Some(stream);
+            Ok(str) => {
+                let _ = str.play();
+                s.input_stream = Some(str);
             }
-            Err(e) => log::error!("Failed to open input stream: {e}"),
+            Err(e) => log::error!("PROBE failed to open mic stream: {e}"),
         }
         Ok(())
     }
@@ -471,6 +503,8 @@ impl AndroidAuto {
         let mut s = HashSet::new();
         s.insert(android_auto::Wifi::sensor_type::Enum::DRIVING_STATUS);
         s.insert(android_auto::Wifi::sensor_type::Enum::NIGHT_DATA);
+        spawn_stream_reporter();
+        start_mixer_output();
         let android_send2 = android_send.clone();
         let relay = tokio::spawn(async move {
             'main_loop: loop {
@@ -621,26 +655,6 @@ impl AndroidAuto {
             }
             (ai, media_stream, sys_stream, speech_stream)
         };
-        let (mixer, mixer_stream) = if media_stream.is_none()
-            || sys_stream.is_none()
-            || speech_stream.is_none()
-        {
-            match cpal::default_host()
-                .default_output_device()
-                .and_then(|d| open_fallback_output(&d))
-            {
-                Some((m, st)) => {
-                    let _ = st.play();
-                    (Some(m), Some(st))
-                }
-                None => {
-                    log::warn!("No output stream could be opened; phone audio will be discarded");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
         Self {
             inner: Arc::new(Mutex::new(AndroidAutoInner {
                 relay: Some(relay),
@@ -653,8 +667,6 @@ impl AndroidAuto {
                 sys_stream,
                 speech_stream,
                 input_stream: None,
-                mixer,
-                mixer_stream,
             })),
             #[cfg(feature = "wireless")]
             bluetooth,
@@ -718,8 +730,6 @@ impl MyEguiApp {
 
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Frames arrive from the phone whether or not the user touches anything; without a
-        // scheduled repaint they are only consumed on input events and the window looks hung.
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
         let mut replace_container = false;
         if let Some(con) = &mut self.container {
