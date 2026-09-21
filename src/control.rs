@@ -413,6 +413,7 @@ impl ChannelHandlerTrait for ControlChannelHandler {
                 }
                 AndroidAutoControlMessage::AudioFocusResponse(_) => unimplemented!(),
                 AndroidAutoControlMessage::AudioFocusRequest(m) => {
+                    log::info!("PROBE audio focus request {:?}", m);
                     let mut m2 = Wifi::AudioFocusResponse::new();
                     let s = if m.has_audio_focus_type() {
                         match m.audio_focus_type() {

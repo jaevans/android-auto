@@ -140,6 +140,8 @@ pub enum FrameIoError {
     IncompatibleVersion(u16, u16),
     /// An error occurred during the ssl handshake
     SslHandshake(String),
+    /// The ssl session ended with an error after the handshake
+    SslSession(String),
     /// A logical error due to frames not being received in the expected order
     Sequence(FrameSequenceError),
     /// An error occurred opening the audio input channel
@@ -1882,8 +1884,11 @@ async fn do_android_auto_loop<T: AndroidAutoMainTrait + ?Sized>(
                     log::info!("SSL Handshake complete");
                 }
                 SslThreadResponse::ExitError(e) => {
+                    // A TLS decrypt failure on one frame used to be a `todo!()` panic here,
+                    // taking the whole head unit down; end this session instead so the
+                    // container can reconnect.
                     log::error!("The error for exit is {}", e);
-                    todo!();
+                    return Err(ClientError::IoError(FrameIoError::SslSession(e)));
                 }
             }
         }
@@ -1901,8 +1906,7 @@ async fn watch_for_disconnect(device_address: Arc<nusb::DeviceInfo>) {
                 if let Ok(mut devs) = devs {
                     if devs
                         .find(|a| {
-                            a.busnum() == device_address.busnum()
-                                && a.device_address() == device_address.device_address()
+                            a.id() == device_address.id()
                         })
                         .is_none()
                     {

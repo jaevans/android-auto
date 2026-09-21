@@ -36,14 +36,14 @@ struct SslStreamThread<U: AsyncWrite + Unpin> {
     hs_started: bool,
     hs_completed: bool,
     hs: Option<tokio::sync::mpsc::Receiver<SslThreadData>>,
-    dout: tokio::sync::mpsc::Sender<SslThreadResponse>,
+    dout: tokio::sync::mpsc::UnboundedSender<SslThreadResponse>,
     write: U,
 }
 
 impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
     fn new(
         rcv: tokio::sync::mpsc::Receiver<SslThreadData>,
-        dout: tokio::sync::mpsc::Sender<SslThreadResponse>,
+        dout: tokio::sync::mpsc::UnboundedSender<SslThreadResponse>,
         conn: rustls::client::ClientConnection,
         write: U,
     ) -> Self {
@@ -64,7 +64,7 @@ impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
                     log::error!("Error receiving frame: {:?}", e);
                     return Err(format!("frame error {:?}", e));
                 }
-                self.dout.send(SslThreadResponse::Data(data)).await;
+                let _ = self.dout.send(SslThreadResponse::Data(data));
             }
             SslThreadData::HandshakeStart => {
                 if self.hs_started {
@@ -114,7 +114,6 @@ impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
                     self.hs_completed = true;
                     self.dout
                         .send(SslThreadResponse::HandshakeComplete)
-                        .await
                         .map_err(|e| e.to_string())?;
                 }
 
@@ -187,8 +186,7 @@ impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
                     if let Err(e) = self.handle_receive(m).await {
                         let _ = self
                             .dout
-                            .send(SslThreadResponse::ExitError(e.to_string()))
-                            .await;
+                            .send(SslThreadResponse::ExitError(e.to_string()));
                         return Err(e);
                     }
                 }
@@ -202,11 +200,11 @@ impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
 
 pub struct StreamMux {
     send: tokio::sync::mpsc::Sender<SslThreadData>,
-    recv: tokio::sync::mpsc::Receiver<SslThreadResponse>,
+    recv: tokio::sync::mpsc::UnboundedReceiver<SslThreadResponse>,
 }
 
 pub struct ReadHalf {
-    recv: tokio::sync::mpsc::Receiver<SslThreadResponse>,
+    recv: tokio::sync::mpsc::UnboundedReceiver<SslThreadResponse>,
 }
 
 #[derive(Clone)]
@@ -255,8 +253,12 @@ impl StreamMux {
         write: U,
         mut read: T,
     ) -> Self {
-        let chan = tokio::sync::mpsc::channel(15);
-        let chan2 = tokio::sync::mpsc::channel(15);
+        // Deadlock fix (vox-car 2026-09-20): `chan` carries both frames-to-decrypt and
+        // frames-to-encrypt; the consumer writes acks into it while the TLS task waits to
+        // hand it decrypted frames. With both bounded, duplex load closes the cycle. The
+        // TLS->consumer leg is unbounded so the TLS task can always drain `chan`.
+        let chan = tokio::sync::mpsc::channel(256);
+        let chan2 = tokio::sync::mpsc::unbounded_channel();
         let chanw = chan2.0.clone();
         let stream = SslStreamThread::new(chan.1, chan2.0, conn, write);
         tokio::spawn(stream.run());
@@ -270,7 +272,7 @@ impl StreamMux {
                         if f.header.frame.get_encryption() {
                             chan_ssl.send(SslThreadData::DecryptMe(f)).await;
                         } else {
-                            chanw.send(SslThreadResponse::Data(f)).await;
+                            let _ = chanw.send(SslThreadResponse::Data(f));
                         }
                     }
                 }
