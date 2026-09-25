@@ -715,13 +715,111 @@ struct MyEguiApp {
     android_auto_texture: Option<egui::TextureHandle>,
     container: Option<AndroidAutoContainer>,
     setup: android_auto::AndroidAutoSetup,
+    /// Taps injected over UDP 127.0.0.1:5577 as "tap X Y" in video pixels, so a script can drive
+    /// the head unit without the mouse. Each becomes POINTER_DOWN now and POINTER_UP 80 ms later.
+    taps: std::sync::mpsc::Receiver<ProbeCmd>,
+    pending_up: Option<((u32, u32), std::time::Instant)>,
+    /// The last decoded frame as packed RGB, width, height — what "shot PATH" writes.
+    last_frame: Option<(Vec<u8>, usize, usize)>,
+}
+
+enum ProbeCmd {
+    Tap(u32, u32),
+    Shot(String),
+}
+
+/// 24-bit bottom-up BMP, so the rig needs no image crate. `sips -s format png` converts it.
+fn write_bmp(path: &str, rgb: &[u8], w: usize, h: usize) -> std::io::Result<()> {
+    let row = (w * 3 + 3) & !3;
+    let size = 54 + row * h;
+    let mut b = Vec::with_capacity(size);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(size as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&[0u8; 24]);
+    for y in (0..h).rev() {
+        let start = b.len();
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            b.extend_from_slice(&[rgb[i + 2], rgb[i + 1], rgb[i]]);
+        }
+        b.resize(start + row, 0);
+    }
+    std::fs::write(path, b)
+}
+
+fn spawn_tap_listener() -> std::sync::mpsc::Receiver<ProbeCmd> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sock = match std::net::UdpSocket::bind("127.0.0.1:5577") {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("PROBE tap listener: {:?}", e);
+                return;
+            }
+        };
+        let mut buf = [0u8; 512];
+        while let Ok(n) = sock.recv(&mut buf) {
+            let line = String::from_utf8_lossy(&buf[..n]);
+            let w: Vec<&str> = line.split_whitespace().collect();
+            if w.len() == 3 && w[0] == "tap" {
+                if let (Ok(x), Ok(y)) = (w[1].parse(), w[2].parse()) {
+                    log::error!("PROBE tap {} {}", x, y);
+                    let _ = tx.send(ProbeCmd::Tap(x, y));
+                }
+            } else if w.len() == 2 && w[0] == "shot" {
+                let _ = tx.send(ProbeCmd::Shot(w[1].to_string()));
+            }
+        }
+    });
+    rx
 }
 
 impl MyEguiApp {
+    fn send_touch(&mut self, x: u32, y: u32, down: bool) {
+        let mut i_event = android_auto::Wifi::InputEventIndication::new();
+        i_event.set_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64,
+        );
+        let mut te = android_auto::Wifi::TouchEvent::new();
+        let mut tl = android_auto::Wifi::TouchLocation::new();
+        tl.set_x(x);
+        tl.set_y(y);
+        tl.set_pointer_id(0);
+        te.touch_location = vec![tl];
+        te.set_touch_action(if down {
+            android_auto::Wifi::touch_action::Enum::POINTER_DOWN
+        } else {
+            android_auto::Wifi::touch_action::Enum::POINTER_UP
+        });
+        i_event.touch_event = android_auto::protobuf::MessageField::some(te);
+        let e = android_auto::AndroidAutoMessage::Input(i_event);
+        if let Some(con) = &mut self.container {
+            if let Err(e) = con
+                .send
+                .blocking_send(MessageToAsync::AndroidAutoMessage(e.sendable()))
+            {
+                log::error!("Error sending injected touch {:?}", e);
+            }
+        }
+    }
+
     fn new(_cc: &eframe::CreationContext<'_>, setup: android_auto::AndroidAutoSetup) -> Self {
         Self {
             android_auto_video_decoder: openh264::decoder::Decoder::new().unwrap(),
             android_auto_texture: None,
+            taps: spawn_tap_listener(),
+            pending_up: None,
+            last_frame: None,
             container: Some(AndroidAutoContainer::new(setup)),
             setup,
         }
@@ -731,6 +829,26 @@ impl MyEguiApp {
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        if let Some(((x, y), at)) = self.pending_up {
+            if at.elapsed() >= std::time::Duration::from_millis(80) {
+                self.pending_up = None;
+                self.send_touch(x, y, false);
+            }
+        } else if let Ok(cmd) = self.taps.try_recv() {
+            match cmd {
+                ProbeCmd::Tap(x, y) => {
+                    self.send_touch(x, y, true);
+                    self.pending_up = Some(((x, y), std::time::Instant::now()));
+                }
+                ProbeCmd::Shot(path) => match &self.last_frame {
+                    Some((rgb, w, h)) => match write_bmp(&path, rgb, *w, *h) {
+                        Ok(()) => log::error!("PROBE shot {} {}x{}", path, w, h),
+                        Err(e) => log::error!("PROBE shot failed {} {:?}", path, e),
+                    },
+                    None => log::error!("PROBE shot {} skipped: no frame yet", path),
+                },
+            }
+        }
         let mut replace_container = false;
         if let Some(con) = &mut self.container {
             while let Ok(v) = con.recv.try_recv() {
@@ -763,6 +881,7 @@ impl eframe::App for MyEguiApp {
                                     let mut rgb_raw = vec![0; rgb_len];
                                     image.write_rgb8(&mut rgb_raw);
                                     let (w, h) = image.dimensions_uv();
+                                    self.last_frame = Some((rgb_raw.clone(), w * 2, h * 2));
                                     let pixels: Vec<egui::Color32> = rgb_raw
                                         .chunks_exact(3)
                                         .map(|i| egui::Color32::from_rgb(i[0], i[1], i[2]))
