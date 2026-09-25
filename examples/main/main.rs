@@ -677,14 +677,14 @@ impl AndroidAuto {
                 address: blue_address,
             },
             config: VideoConfiguration {
-                resolution: android_auto::Wifi::video_resolution::Enum::_480p,
+                resolution: android_auto::Wifi::video_resolution::Enum::_720p,
                 fps: android_auto::Wifi::video_fps::Enum::_30,
                 dpi: 111,
             },
             sensors: android_auto::SensorInformation { sensors: s },
             input_config: android_auto::InputConfiguration {
                 keycodes: vec![1, 2, 3, 4, 5],
-                touchscreen: Some((800, 480)),
+                touchscreen: Some((1280, 720)),
             },
         }
     }
@@ -1131,7 +1131,7 @@ impl AndroidAutoContainer {
                         car_model: "Desktop Head Unit".to_string(),
                         car_year: "1943".to_string(),
                         car_serial: "42".to_string(),
-                        left_hand: false,
+                        left_hand: true,
                         head_manufacturer: "Example".to_string(),
                         head_model: "Example".to_string(),
                         sw_build: "37".to_string(),
