@@ -1124,8 +1124,11 @@ impl AndroidAutoContainer {
                 );
                 let config = android_auto::AndroidAutoConfiguration {
                     unit: HeadUnitInfo {
-                        name: "Example".to_string(),
-                        car_model: "Example".to_string(),
+                        // Operator-authorised 2026-09-24: report Google's Desktop Head Unit identity,
+                        // which gearhead's CAR.VALIDATOR treats as a developer head unit, so a
+                        // sideloaded (non-Play) car app can be tested on the desk.
+                        name: "Google".to_string(),
+                        car_model: "Desktop Head Unit".to_string(),
                         car_year: "1943".to_string(),
                         car_serial: "42".to_string(),
                         left_hand: false,
