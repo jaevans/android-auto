@@ -189,9 +189,7 @@ impl<U: AsyncWrite + Unpin> SslStreamThread<U> {
             match hs.recv().await {
                 Some(m) => {
                     if let Err(e) = self.handle_receive(m).await {
-                        let _ = self
-                            .dout
-                            .send(SslThreadResponse::ExitError(e.to_string()));
+                        let _ = self.dout.send(SslThreadResponse::ExitError(e.to_string()));
                         return Err(e);
                     }
                 }

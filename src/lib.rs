@@ -1911,12 +1911,7 @@ async fn watch_for_disconnect(device_address: Arc<nusb::DeviceInfo>) {
             nusb::hotplug::HotplugEvent::Disconnected(_info) => {
                 let devs = nusb::list_devices().await;
                 if let Ok(mut devs) = devs {
-                    if devs
-                        .find(|a| {
-                            a.id() == device_address.id()
-                        })
-                        .is_none()
-                    {
+                    if devs.find(|a| a.id() == device_address.id()).is_none() {
                         log::info!("Android Auto USB device disconnected");
                         break;
                     }
